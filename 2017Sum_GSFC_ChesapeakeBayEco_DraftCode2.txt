@@ -1,0 +1,215 @@
+// GEE Script: CB_NDVI_anomoly_DEVELOP_DL
+// Team: Chesapeake Bay Ecological Forecasting - Goddard Space Flight Center
+// Date: Summer 2017
+// Contact: John Fitz - johnfitz058@gmail.com or john.m.fitz@nasa.gov
+
+// Description:  This GEE script calculates average NDVI for a 10 year reference period and then determines positive and negative changes from
+//               that mean value and displays 'hot spots' for areas of marsh degredation and improvement.  Once the anomolies (pos or neg NDVI changes)
+//               are determined, they are diplayed on the GEE map by color - red represents NDVI loss, green represents NDVI gain and the brighter
+//               the color, the greater the change.  The user can then move the markers (2 for regenerated sites and 2 for degraded sites) to specific
+//               areas within the study area for further examination.  The script then generates a series of graphs based on chosen marker locations 
+//               to include NDVI changes across several regions, NDVI over time for loss and gain areas and cumulative gain and loss graphs.
+
+
+// Usage: This code is scripted in JavaScript to be run in the code editor of Google Earth Engine.
+//        The script requires some inputs for MD marsh mask (currently using the Maryland Deptartment of Natural Resources (MD DNR)
+//        Maryland Marsh Protection Potential Index Layer).  
+
+// Parameters:
+//      In: SRTM, L5ndvi, L8ndvi, 2 degraded point markers, 2 regenerated point markers, CB study area polygon, MDmarshes raster mask, 
+//      Out: Several layers to be added to GEE Map visualization, exported graphs for changes in NDVI at various selected locations (user chosen) and 
+//           exported loss and gain maps (future)
+
+
+
+//        updated 7/25/2017 
+
+
+// Script Imports
+var L5ndvi = ee.ImageCollection("LANDSAT/LT5_L1T_8DAY_NDVI"),
+    srtm = ee.Image("USGS/SRTMGL1_003"),
+    L8ndvi = ee.ImageCollection("LANDSAT/LC8_L1T_8DAY_NDVI"),
+    L7ndvi = ee.ImageCollection("LANDSAT/LE7_L1T_8DAY_NDVI"),
+    MDmarshes_old = ee.Image("users/johnfitz058/mmppi_raster"),
+    degradedCB1 = /* color: #f11701 */ee.Geometry.Point([-76.1491584777832, 38.424949413999606]),
+    degradedCB2 = /* color: #ff3507 */ee.Geometry.Point([-75.8304637670517, 38.16729639084611]),
+    regeneratedCB1 = /* color: #04c21b */ee.Geometry.Point([-76.3711166381836, 38.752342965551726]),
+    regeneratedCB2 = /* color: #3dff0d */ee.Geometry.Point([-75.9320068359375, 38.17424237745006]),
+    CB = /* color: #98ff00 */ee.Geometry.Polygon(
+        [[[-76.343994140625, 39.16414104768743],
+          [-76.453857421875, 38.80118939192329],
+          [-76.4154052734375, 38.57823196583313],
+          [-75.9979248046875, 37.77505678240509],
+          [-75.904541015625, 37.82280243352756],
+          [-76.1297607421875, 37.142803443716836],
+          [-75.8770751953125, 37.10776507118514],
+          [-75.574951171875, 37.54457732085582],
+          [-75.7012939453125, 39.58875727696545],
+          [-76.2945556640625, 39.65645604812829]]]),
+    MDmarshes = ee.Image("users/johnfitz058/mmppiRas21");
+ 
+var aoi = CB;
+var mmppi = ee.FeatureCollection('ft:1gKnoxYngSu2ejwnvfilBePYId1qVsgiPy4Hz0X9d', 'geometry');
+var degradedsites = ee.FeatureCollection([degradedCB1,degradedCB2]);
+var regensites = ee.FeatureCollection([regeneratedCB2,regeneratedCB1]);
+
+var MDmarshes = MDmarshes.mask(MDmarshes.neq(255))
+
+Map.addLayer(MDmarshes,{},'MD Marshes')
+var MDmarshes = MDmarshes.focal_max(1000,'square','meters')
+
+// Load Imagery
+var collection = L5ndvi.select('NDVI');  // Landsat
+
+
+//// START of NDVI Change
+  // Define reference conditions from the first 10-15 years of data.
+  var reference = collection.filterDate('1984-01-01', '1995-12-31')
+    // Sort chronologically in descending order.
+    .sort('system:time_start', false);
+
+      // Compute the mean of the first 10 years.
+      var mean = reference.mean()//.mask(MangroveMap);
+      Map.addLayer(mean,{min:-0.5,max:0.5},'Mean')
+      // THIS MERGES MULTIPLE COLLECTIONS TOGETHER
+      // I REMOVED THIS BECAUSE THE COMPUTATION TIMES OUT
+      // THIS DATA PROBABLY NEEDS TO BE SMOOTHED
+      var collection = ee.ImageCollection(collection.merge(L8ndvi.select('NDVI')));
+      //var collection = ee.ImageCollection(collection.merge(L7ndvi.select('NDVI')));
+
+      print(collection,'collection');
+
+// Get the timestamp from the most recent image in the reference collection.
+  var time0 = reference.first().get('system:time_start');
+      
+      // Compute anomalies by subtracting the 1984-1995 mean from each image in a
+      // collection of 1996-2017 images. Copy the date metadata over to the
+      // computed anomaly images in the new collection.
+      var series = collection.filterDate('1996-01-01', '2017-12-31').map(function(image) {
+          return image.subtract(mean).mask(MDmarshes)
+                    .set('system:time_start', image.get('system:time_start'))
+                    //.mask(MangroveMap);
+      });
+      
+      var last = series.filterDate('2015-01-01','2017-01-01').max()
+      Map.addLayer(last,{min:-0.5,max:0.5},'Last')
+// NDVI based land change. Tresholds are -30 (loss) and 50 (gain)
+      var anomoly = series.sum().clip(CB)
+      var loss = anomoly.mask(anomoly.lt(-25))
+      var gain = anomoly.mask(anomoly.gt(50))
+      
+// How much of the areas is gained
+      var gainarea = gain.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: CB,
+        scale: 30,
+        maxPixels: 1e9
+      });
+      
+      print(gainarea, 'gainarea');
+
+      // Display cumulative anomalies.
+ 
+      Map.centerObject(CB, 10);
+      Map.addLayer(series.sum(),
+          {min: -50, max: 50, palette: ['FF0000', '000000', '00FF00']}, 'EVI anomaly');
+      Map.addLayer(loss,{palette:['FF0000']}, 'NDVI Loss');
+      Map.addLayer(gain,{palette:['00FF00']}, 'NDVI gain');
+
+//START ACCUMULATION
+// Get the timestamp from the most recent image in the reference collection.
+  var time0 = reference.first().get('system:time_start');
+
+// Use imageCollection.iterate() to make a collection of cumulative anomaly over time.
+// The initial value for iterate() is a list of anomaly images already processed.
+// The first anomaly image in the list is just 0, with the time0 timestamp.
+  var first = ee.List([
+    // Rename the first band 'EVI'.
+    ee.Image(0).set('system:time_start', time0).select([0], ['NDVI']).clip(aoi)
+
+  ]);
+//#############################################
+// This is a function to pass to Iterate().
+//#############################################
+// As anomaly images are computed, add them to the list.
+  var accumulate = function(image, list) {
+    // Get the latest cumulative anomaly image from the end of the list with
+    // get(-1).  Since the type of the list argument to the function is unknown,
+    // it needs to be cast to a List.  Since the return type of get() is unknown,
+    // cast it to Image.
+    var previous = ee.Image(ee.List(list).get(-1));
+    // Add the current anomaly to make a new cumulative anomaly image.
+    var added = image.add(previous)
+      // Propagate metadata to the new image.
+      .set('system:time_start', image.get('system:time_start'));
+    // Return the list with the cumulative anomaly inserted.
+    return ee.List(list).add(added);
+  };
+
+// Create an ImageCollection of cumulative anomaly images by iterating.
+// Since the return type of iterate is unknown, it needs to be cast to a List.
+  var cumulative = ee.ImageCollection(ee.List(series.iterate(accumulate, first)))
+    print(cumulative, 'cumulative');
+
+Map.addLayer(mmppi,{'color': 'FBB117'}, 'Maryland Marsh Protection Potential Index', false);
+
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//  STICK YOUR CHARTS UP
+// Chart some interesting locations.
+
+var timeseries = ui.Chart.image.seriesByRegion(
+  cumulative, degradedCB1, ee.Reducer.mean() , 'NDVI',30, 'system:time_start')
+  .setChartType('ScatterChart');
+print(timeseries)
+
+
+//  LOSS EXAMPLE
+print(ui.Chart.image.seriesByRegion(collection, degradedsites, ee.Reducer.mean(),'NDVI',30)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'NDVI over time - Degradation',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI'}}));
+
+//  GAIN EXAMPLE            
+print(ui.Chart.image.seriesByRegion(collection, regensites, ee.Reducer.mean(),'NDVI',30)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'NDVI over time - Regeneration',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI'}}));
+            
+
+// Loss Example w/ Anomalies
+print(ui.Chart.image.series(collection, degradedCB2, ee.Reducer.mean(),10)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'Loss - NDVI - collection',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI'}}));
+
+print(ui.Chart.image.series(cumulative, degradedCB2, ee.Reducer.mean(),10)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'Loss - NDVI - cumulative',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI anamoly'}}));
+
+// Gain Example  w/ Anomalies 
+print(ui.Chart.image.series(collection, regeneratedCB2, ee.Reducer.mean(),10)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'Gain - NDVI - collection',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI anamoly'}}))
+print(ui.Chart.image.series(cumulative, regeneratedCB2, ee.Reducer.mean(),10)
+      .setChartType('ScatterChart')
+      .setOptions( {title: 'Gain - NDVI - cumulative',
+            fontSize: 20,
+            hAxis: {title: 'Date'},
+            vAxis: {title: 'NDVI anamoly'}}))
+
+
+
+

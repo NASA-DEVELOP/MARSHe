@@ -1,0 +1,148 @@
+// GEE Script: Wetland_Classification_DEVELOP
+// Team: Chesapeake Bay Ecological Forecasting - Goddard Space Flight Center
+// Date: Summer 2017
+// Contact: John Fitz - johnfitz058@gmail.com or john.m.fitz@nasa.gov
+
+// Description:  This GEE script performs an unsupervised classification to determine wetland extent
+// Usage: This code is scripted in JavaScript to be run in the code editor of Google Earth Engine.
+//        The script requires some inputs for Marsh Mask, as well as the operator to hand select classes
+//        from the classified map and add them to the script for the creation of the marsh extent layer.
+//        Additional date and dataset selection must also occur to find marsh extent for different years (future drafts will include this)
+
+
+// Parameters:
+//      In: SRTM, L8, L8toa, L8rs, sentinel1, CB polygon for study area, MDmarshes raster mask, 
+//      Out: Several layers to be added to GEE Map visualization, exported marsh extent maps and statistics (eventually)
+
+
+// Script Imports
+var SRTM = ee.Image("USGS/SRTMGL1_003"),
+    L8 = ee.ImageCollection("LANDSAT/LC8_SR"),
+    L8toa = ee.ImageCollection("LANDSAT/LC8_L1T_TOA"),
+    L8rs = ee.ImageCollection("LANDSAT/LC8_L1T"),
+    sentinel = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    countries = ee.FeatureCollection("USDOS/LSIB/2013"),
+    CB = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-76.1572265625, 39.76491812800949],
+          [-76.893310546875, 39.205300346969246],
+          [-77.84912109375, 38.65834825141966],
+          [-76.717529296875, 36.70219191643146],
+          [-75.56396484375, 36.86057804436293],
+          [-74.7509765625, 38.297122431868644],
+          [-74.520263671875, 39.06895788361021],
+          [-75.179443359375, 39.59581266660509],
+          [-75.6298828125, 39.790248224517754]]]);
+
+
+var MDmarshes = ee.Image('users/johnfitz058/mmppiRas21') //new raster mask
+var marshes = ee.Image('users/johnfitz058/mmppi_raster')
+var marshes = marshes.mask(marshes.neq(65535))
+Map.addLayer(marshes,{},'MD Marshes')
+
+// Height Mask from SRTM DEM (2000)
+  var srtm = SRTM.lt(50)//.clip(geometry8) ;
+  Map.addLayer(srtm,{min:0,max:50},'SRTM Mask',false)
+// //#####################################
+
+// SELECT AOI - a simple polygon capturing the entire Chesapeake Bay Watershed
+  var aoi = CB;
+
+
+      // Sort through radar data 
+      var radar = sentinel.filterDate('2016-01-01','2017-01-01')//.filterBounds(geometry)
+      .filter(ee.Filter.gt('VH_log_bias', 0))
+      // Select max value over the time period
+      var radar = radar.max()//.mask(srtm)
+      // New Bands: VH and VV
+      var radar = radar.select('VH','VV')
+      var radwater = radar.lt(-16)
+      // New Band: Radar VV divided by VH 
+      var radar1 = radar.select('VV').divide(radar.select('VH')).rename('VVVH')
+   
+      Map.addLayer(radar1,{},'radar ration VV/VH',false)
+
+// CREATE addIndex Function
+//  This function maps out various band indices for Landsat 8 (indices for vegetation, water, (and soil in future))
+      var addIndex = function(img){
+          var ndvi = img.normalizedDifference(['B5','B4']).rename('ndvi');
+          var ndwi = img.normalizedDifference(['B5','B6']).rename('ndwi');
+          var ndwbi = img.normalizedDifference(['B3','B5']).rename('ndwbi');
+      // Band ratios: reference Green, E.P.; Clark, C.D.; Mumby, P.J.; Edwards, A.J.;
+      // Ellis, A.C. Remote sensing techniques for mangrove mapping. Int. J. Remote 
+      // Sens. 1998, 19, 935–956.
+          var ratio54 = img.select('B6').divide(img.select('B5')).rename('r54');
+          var ratio35 = img.select('B4').divide(img.select('B6')).rename('r35');
+          return img.addBands(ndvi).addBands(ndwi).addBands(ndwbi).addBands(ratio54).addBands(ratio35)//.mask(srtmmask)
+      }
+// Filter Landsat 8 data for the period of interest (2016-2017)
+   var newcol = L8toa.filterDate('2016-01-01', '2017-01-01')
+        .select("B2","B3","B4","B5","B6","B7","B8","B9") 
+        .map(addIndex)
+ 
+ 
+// New Bands: Calculate NDVI StdDev and mean for time period      
+    var ndvisd = newcol.select('ndvi').reduce(ee.Reducer.stdDev()).rename('StdDev')
+    var ndvi_mean = newcol.select('ndvi').reduce(ee.Reducer.mean()).rename('mean')
+    var ndvi_watermask = ndvi_mean.gt(0)
+
+    Map.addLayer(ndvi_watermask,{},'NDVI Mean',false)
+
+
+ 
+ // Creat Quality Composite using NDVI and add additional bands
+ // Additional Bands: Optical indices, StdDev, VV, VH, and VV/VH 
+     var composite = newcol.qualityMosaic('ndvi').addBands(ndvisd).addBands(radar).addBands(radar1).addBands(srtm)
+     var composite = composite.mask(srtm)
+     var composite = composite.mask(ndvi_watermask)
+     Map.addLayer(composite,{},'composite',false)
+ 
+    
+    // Define a region in which to generate a sample of the input.
+      var region = aoi;
+      var input = composite; // input image
+    
+    // Display the sample region.
+      Map.centerObject(aoi,10);
+      Map.addLayer(ee.Image().paint(region, 0, 2), {}, 'region',false);
+    
+    // Make the training dataset.
+      var training = input.sample({
+        region: region,
+        scale: 30,
+        numPixels: 5000
+      });
+      
+    // Instantiate the clusterer and train it.
+      var numclass = 50; // number of classes 
+      var clusterer = ee.Clusterer.wekaKMeans(numclass).train(training);
+
+
+    // Cluster the input using the trained clusterer.
+      var result = input.cluster(clusterer);
+
+        // Smoothing filter
+        var mode = result.focal_mode(100,'square','meters')
+        Map.addLayer(mode.randomVisualizer(), {}, 'classification clusters mode',false);
+
+
+        // Classification results
+        // for the test variable, find the number of the classes that you want to join
+        // and add them to the list. Requires operator to select class value number to add for selection
+        // and merging of the wetland pixels (continue adding '.add(image.eq())' once all are selected.
+        var image = mode.mask(ndvi_watermask)
+        var test = image.eq(47)
+          .add(image.eq(10))
+          .add(image.eq(17))
+          // .add(image.eq(5))
+          .add(image.eq(49))
+          // .add(image.eq(29))
+          // .add(image.eq(1))
+        var test =test.mask(test)
+        
+
+    // Display the clusters with random colors.
+      Map.addLayer(result.randomVisualizer(), {band:'cluster'}, 'classification clusters',false);
+    
+    // Display the merged classes, which represents the classified marsh extent
+      Map.addLayer(test,{palette: '#0aff08'} , 'merging of classes');
+
